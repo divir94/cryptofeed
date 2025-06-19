@@ -108,3 +108,7 @@ ENV/
 
 # PyCharm
 .idea/
+
+
+# Credentials
+config.yaml

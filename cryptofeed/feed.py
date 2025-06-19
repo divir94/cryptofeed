@@ -170,6 +170,7 @@ class Feed(Exchange):
             sub = {}
             for channel in subscription:
                 for pair in subscription[channel]:
+                    LOG.info(f"Subscribing to {pair} on {channel}")
                     if channel not in sub:
                         sub[channel] = []
                     sub[channel].append(pair)
@@ -287,6 +288,7 @@ class Feed(Exchange):
         """
         Create tasks for exchange interfaces and backends
         """
+        LOG.info('Starting feed %s', self.id)
         for conn, sub, handler, auth in self.connect():
             self.connection_handlers.append(ConnectionHandler(conn, sub, handler, auth, self.retries, timeout=self.timeout, timeout_interval=self.timeout_interval, exceptions=self.exceptions, log_on_error=self.log_on_error, start_delay=self.start_delay))
             self.connection_handlers[-1].start(loop)

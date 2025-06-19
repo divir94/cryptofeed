@@ -27,7 +27,7 @@ LOG = logging.getLogger('feedhandler')
 
 
 class CoinbaseRestMixin(RestExchange):
-    api = "https://api.pro.coinbase.com"
+    api = "https://api.coinbase.com/api/v3/brokerage"
     sandbox_api = "https://api-public.sandbox.pro.coinbase.com"
     rest_channels = (
         TRADES, TICKER, L2_BOOK, L3_BOOK, ORDER_INFO, ORDER_STATUS, CANDLES, CANCEL_ORDER, PLACE_ORDER, BALANCES, TRADE_HISTORY

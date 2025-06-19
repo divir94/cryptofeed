@@ -8,11 +8,13 @@ import datetime
 import hashlib
 import hmac
 import logging
+import secrets
 import time
 from decimal import Decimal
 from typing import Dict, Tuple
 from collections import defaultdict
 
+import jwt
 from yapic import json
 
 from cryptofeed.config import Config
@@ -24,6 +26,7 @@ from cryptofeed.exchanges.mixins.coinbase_rest import CoinbaseRestMixin
 from cryptofeed.types import OrderBook, Trade
 
 LOG = logging.getLogger('feedhandler')
+REQUEST_HOST = 'api.coinbase.com'
 
 
 def get_private_parameters(config: Config, chan: str = None, product_ids_str: list = None,
@@ -41,16 +44,48 @@ def get_private_parameters(config: Config, chan: str = None, product_ids_str: li
         message.encode("utf-8"),
         digestmod=hashlib.sha256,
     ).hexdigest()
+
+    uri = f"GET {REQUEST_HOST}{endpoint}"
+    jwt_token = _build_jwt(config["coinbase"]["key_id"], config["coinbase"]["key_secret"], uri)
+
     if rest_api:
-        return {'CB-ACCESS-KEY': config["coinbase"]["key_id"], 'CB-ACCESS-TIMESTAMP': timestamp,
-                'CB-ACCESS-SIGN': signature}
+        return {
+            'CB-ACCESS-KEY': config["coinbase"]["key_id"],
+            'CB-ACCESS-TIMESTAMP': timestamp,
+            'CB-ACCESS-SIGN': signature,
+            'Authorization': f'Bearer {jwt_token}'
+        }
     else:
-        return {'api_key': config["coinbase"]["key_id"], 'timestamp': timestamp, 'signature': signature}
+        return {
+            'api_key': config["coinbase"]["key_id"],
+            'timestamp': timestamp,
+            'signature': signature,
+            'jwt': jwt_token
+        }
+
+
+def _build_jwt(key_id: str, key_secret: str, uri: str | None = None) -> str:
+    jwt_payload = {
+        'sub': key_id,
+        'iss': "cdp",
+        'nbf': int(time.time()),
+        'exp': int(time.time()) + 120,
+    }
+    if uri:
+        jwt_payload['uri'] = uri
+
+    jwt_token = jwt.encode(
+        jwt_payload,
+        key_secret,
+        algorithm='ES256',
+        headers={'kid': key_id, 'nonce': secrets.token_hex()},
+    )
+    return jwt_token
 
 
 class Coinbase(Feed, CoinbaseRestMixin):
     id = COINBASE
-    websocket_endpoints = [WebsocketEndpoint('wss://advanced-trade-ws.coinbase.com', options={'compression': None})]
+    websocket_endpoints = [WebsocketEndpoint('wss://advanced-trade-ws.coinbase.com', options={'compression': None}, authentication=None)]
     rest_endpoints = [
         RestEndpoint('https://api.coinbase.com/api/v3/brokerage', routes=Routes('/products', l3book='/product_book?product_id={}'))]
 
@@ -75,12 +110,19 @@ class Coinbase(Feed, CoinbaseRestMixin):
 
     @classmethod
     def symbols(cls, config: dict = None, refresh=False) -> list:
-        config = Config(config)
-        if 'coinbase' not in config or 'key_id' not in config['coinbase'] or 'key_secret' not in config['coinbase']:
-            raise ValueError('You must provide key_id and key_secret in config to retrieve symbols from Coinbase.')
-        headers = get_private_parameters(config, rest_api=True, endpoint='products')
+        headers = cls._get_auth_headers(Config(config))
         return list(cls.symbol_mapping(refresh=refresh, headers=headers).keys())
 
+    def symbol_mapping(self, refresh=False, headers: dict = None) -> Dict:
+        if headers is None:
+            headers = self._get_auth_headers(self.config)
+        return super().symbol_mapping(refresh=refresh, headers=headers)
+
+    def _get_auth_headers(self, config: Config = None) -> dict:
+        if 'coinbase' not in config or 'key_id' not in config['coinbase'] or 'key_secret' not in config['coinbase']:
+            raise ValueError(f'You must provide key_id and key_secret in config to retrieve symbols from Coinbase. config: {config}')
+        return get_private_parameters(config, rest_api=True, endpoint='products')
+    
     def __init__(self, callbacks=None, **kwargs):
         super().__init__(callbacks=callbacks, **kwargs)
         self.__reset()
@@ -120,7 +162,7 @@ class Coinbase(Feed, CoinbaseRestMixin):
         bids = {Decimal(update['price_level']): Decimal(update['new_quantity']) for update in msg['updates'] if
                 update['side'] == 'bid'}
         asks = {Decimal(update['price_level']): Decimal(update['new_quantity']) for update in msg['updates'] if
-                update['side'] == 'ask'}
+                update['side'] != 'bid'}
         if pair not in self._l2_book:
             self._l2_book[pair] = OrderBook(self.id, pair, max_depth=self.max_depth, bids=bids, asks=asks)
         else:
@@ -163,30 +205,38 @@ class Coinbase(Feed, CoinbaseRestMixin):
                         await self._pair_level2_update(event, timestamp, msg['timestamp'])
                     elif event.get('type') == 'snapshot':
                         await self._pair_level2_snapshot(event, timestamp)
-                elif msg['channel'] == 'subscriptions':
+                elif msg['channel'] in {'subscriptions', 'heartbeats'}:
                     pass
                 else:
                     LOG.warning("%s: Invalid message type %s", self.id, msg)
                 # PERF perf_end(self.id, 'msg')
                 # PERF perf_log(self.id, 'msg')
+        elif msg['type'] == 'error':
+            raise RuntimeError(f"{self.id}: Error message received: {msg}")
+        else:
+            LOG.warning("%s: Invalid message type %s", self.id)
 
     async def subscribe(self, conn: AsyncConnection):
         self.__reset()
         all_pairs = list()
 
         async def _subscribe(chan: str, product_ids: list):
-            params = {"type": "subscribe",
-                      "product_ids": product_ids,
-                      "channel": chan
-                      }
+            params = {
+                "type": "subscribe",
+                "product_ids": product_ids,
+                "channel": chan
+            }
             private_params = get_private_parameters(self.config, chan, product_ids)
             if private_params:
-                params = {**params, **private_params}
+                params.update(private_params)
+
+            LOG.info("%s: Subscribing to channel %s", self.id, chan)
             await conn.write(json.dumps(params))
 
         for channel in self.subscription:
             all_pairs += self.subscription[channel]
             await _subscribe(channel, self.subscription[channel])
+
         all_pairs = list(dict.fromkeys(all_pairs))
-        await _subscribe('heartbeat', all_pairs)
+        await _subscribe('heartbeats', all_pairs)
         # Implementing heartbeat as per Best Practices doc: https://docs.cloud.coinbase.com/advanced-trade-api/docs/ws-best-practices
